@@ -1,4 +1,4 @@
--- I2C master
+-- I2C writing master
 -- Sasha C. Guerrero
 -- 2026 July 14
 
@@ -14,15 +14,16 @@ ENTITY i2c_writing_master IS
 	rst : in std_logic;
 	str : in std_logic;
 	data_in : in std_logic_vector(7 downto 0);
-	thld : in std_logic_vector(2 downto 0);
+	limit : in std_logic_vector(2 downto 0);
 	
 	--outputs
 	SDA : inout std_logic; -- bidir
 	SCL : out std_logic;
 	ack_cnt : out std_logic_vector(2 downto 0);
+	done_byte_out : out std_logic;
+	data_select : out std_logic_vector(2 downto 0);
 	done : out std_logic;
-	rdy : out std_logic;
-	received_data : out std_logic_vector(7 downto 0)
+	rdy : out std_logic
 	);
 END ENTITY;
 
@@ -41,6 +42,8 @@ signal rst_ack_i : std_logic;
 
 BEGIN
 
+data_select <= byte_ctr_i;
+
 -- block for writing a single byte
 i2c_writing : entity work.i2c_writing
 	port map(
@@ -52,8 +55,7 @@ i2c_writing : entity work.i2c_writing
 		rdy => rdy_i, --signal
 		ACK => ack_i, --signal
 		SDA => SDA,
-		SCL => SCL,
-		Q => received_data
+		SCL => SCL
 	);
 
 -- block for writing multiple bytes
@@ -73,7 +75,8 @@ fsm_i2c_writing_master : entity work.fsm_i2c_writing_master
 		
 		EN_ack_ctr => en_ack_i, --signal
 		rst_ack_ctr => rst_ack_i, --signal
-
+	
+		done_byte_out => done_byte_out,
 		done => done,
 		rdy => rdy
 	);
@@ -99,7 +102,7 @@ byte_ctr : entity work.counter_w_EN
 byte_lim_logic : entity work.LimitLogic
 	generic map (n => 3)
 	port map(
-		A => thld,
+		A => limit,
 		B => byte_ctr_i, -- feed count into limlogic
 		Zout => byte_lim_i
 	);

@@ -17,17 +17,17 @@ Flash command:
 Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
 
 // SPI pin definitions
-#define NANO_CS_PIN 5
+#define NANO_CS_PIN 13
 
 // ── I2C bus pin definitions ───────────────────────────────────────────────────
 #define BANK0_SDA 3  //21
 #define BANK0_SCL 4  //22
 
-#define BANK1_SDA 18
-#define BANK1_SCL 19
+#define BANK1_SDA 5
+#define BANK1_SCL 6
 
-#define BANK2_SDA 25  // Bit-bang I2C
-#define BANK2_SCL 26  // Bit-bang I2C
+#define BANK2_SDA 9  // Bit-bang I2C
+#define BANK2_SCL 10  // Bit-bang I2C
 
 // ── I2C bus objects (hardware only for banks 0 & 1) ──────────────────────────
 TwoWire* const i2cHW[2] = { &Wire, &Wire1 };
@@ -296,6 +296,7 @@ void loop() {
       offStr = msg.substring(firstSpaceIdx + 1, secondSpaceIdx);
       dacStr = msg.substring(secondSpaceIdx + 1, thirdSpaceIdx);
       voltStr = msg.substring(thirdSpaceIdx + 1);
+      Serial.println(voltStr);
 
       // I2C continues here
       int offValue = offStr.toInt();
@@ -314,6 +315,7 @@ void loop() {
       dacWriteReg(bank, chip, REG_DAC, code);
 
       // Update TFT
+      //--------------------------------------------------
       tft.fillScreen(ST77XX_BLACK);
       tft.setTextSize(3);
 
@@ -323,18 +325,23 @@ void loop() {
       tft.print("DAC: ");
       tft.setTextColor(ST77XX_WHITE);
       tft.print(dacIndex);
-
+      
       if (offValue) {
+        //---------------------------------------
         tft.setTextColor(ST77XX_RED);
         tft.println(" OFF");
+        //--------------------------------------
         dacWriteReg(bank, chip, REG_CONFIG, 0x0001);  // power down bit (0) value 1
       } else {
+        //----------------------------------------------------
         tft.setTextColor(ST77XX_GREEN);
+        //----------------------------------------------------
         tft.println(" ON");
         dacWriteReg(bank, chip, REG_CONFIG, 0x0000);  // change power down bit (0) to value 0
       }
 
       // Row 2: Voltage
+      
       tft.setTextColor(ST77XX_CYAN);
       tft.setCursor(0, 70);
       tft.println("VOLTAGE:");

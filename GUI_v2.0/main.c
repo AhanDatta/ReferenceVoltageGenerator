@@ -1,7 +1,6 @@
 /*
 To compile and run:
-gcc $(pkg-config --cflags gtk4) -o main main.c $(pkg-config --libs gtk4) -lm
-./main
+gcc $(pkg-config --cflags gtk4) -o main main.c $(pkg-config --libs gtk4) -lm && ./main
 */
 
 #include <gtk/gtk.h>
@@ -38,6 +37,13 @@ const uint8_t REG_DAC = 0x08;
 const uint8_t NUM_BANKS = 3;
 const uint8_t DACS_PER_BANK = 4;
 const uint8_t TOTAL_DACS = NUM_BANKS * DACS_PER_BANK;
+const uint8_t DAC_ADDR[4] = {0x48, 0x49, 0x4A, 0x4B}; 
+
+// Microcontroller will use this starting byte to determine how to read the subsequent bytes
+// GUI tells the microcontroller what to do. Microcontroller does the actual I2C/SPI.
+const uint8_t DAC_CMD_START = 0x00; // writing voltage value to a DAC
+const uint8_t RST_CMD_START = 0x01; // pulling down Reset pin
+const uint8_t SPI_CMD_START = 0x02; // writing SPI command
 
 uint16_t voltageToCode(float v) {
   if (v <= 0.0f) return 0x0000;
@@ -55,6 +61,13 @@ typedef struct {
     GtkDropDown *baud_dropdown;
 } ConnectData;
 
+// SPI settings dropdowns
+typedef struct {
+    GtkDropDown *speed_dropdown;
+    GtkDropDown *bit_order_dropdown;
+    GtkDropDown *mode_dropdown;
+} SPISettingsData;
+
 // per-channel Update button data
 typedef struct {
     int         ch;
@@ -64,12 +77,11 @@ typedef struct {
 
 // data for the "All OFF / All ON / All UPDATE" buttons
 typedef struct {
-    GtkWidget       *off_buttons[12];    // the 12 per-channel toggle buttons
+    GtkToggleButton *off_buttons[12];    // the 12 per-channel toggle buttons
     BtnCallbackData *off_data[12];       // the 12 BtnCallbackData pointers for the off buttons
                                          // (needed to match the handler when blocking/unblocking signals)
     GtkWidget       *entry_boxes[12];    // the 12 per-channel voltage entries
     ConnectData     *conn;               // shared serial dropdowns
-    int              channel_values[12]; // channel index for each row
 } AllBtnData;
 
 // Radio button state to choose which bytes to send
@@ -78,7 +90,8 @@ typedef struct {
 	GtkWidget *radio_btn1;
 	GtkWidget *radio_btn2;
     GtkWidget *byte_entries[3];
-    ConnectData *conn; // pointer to the shared ConnectData
+    ConnectData *conn;
+    SPISettingsData *settings;
 } RadioBtnSelect;
 
 // voltage helper functions
@@ -148,10 +161,10 @@ static serial_fd_t open_serial(const char *port, DWORD baud) {
     if (!SetCommState(hPort, &dcb)) { CloseHandle(hPort); return INVALID_HANDLE_VALUE; }
 
     COMMTIMEOUTS timeouts = { 0 };
-    timeouts.ReadIntervalTimeout         = 50;
-    timeouts.ReadTotalTimeoutConstant    = 500;
-    timeouts.ReadTotalTimeoutMultiplier  = 10;
-    timeouts.WriteTotalTimeoutConstant   = 500;
+    timeouts.ReadIntervalTimeout         = MAXDWORD; //50
+    timeouts.ReadTotalTimeoutConstant    = 0; //500
+    timeouts.ReadTotalTimeoutMultiplier  = 0; //10
+    timeouts.WriteTotalTimeoutConstant   = 500
     timeouts.WriteTotalTimeoutMultiplier = 10;
     SetCommTimeouts(hPort, &timeouts);
 
@@ -227,9 +240,8 @@ static int serial_is_invalid(serial_fd_t fd) {
 
 #endif /* _WIN32 */
 
-// Reads the selected COM port and baud rate strings from the shared
-// dropdowns. Returns FALSE (leaving *port_out/*baud_out untouched) if either
-// dropdown has nothing selected.
+// Reads the selected COM port and baud rate strings from the shared dropdowns.
+// Returns FALSE (leaving *port_out/*baud_out untouched) if either dropdown has nothing selected.
 static gboolean get_port_and_baud(ConnectData *conn, const char **port_out, const char **baud_out) {
     GtkStringObject *com_obj  = GTK_STRING_OBJECT(
         gtk_drop_down_get_selected_item(conn->com_dropdown));
@@ -252,9 +264,9 @@ static serial_fd_t open_serial_from_conn(ConnectData *conn) {
     }
 
     serial_fd_t fd = open_serial(port, baud_from_string(baud_str));
-    if (serial_is_invalid(fd)) {
+    /*if (serial_is_invalid(fd)) {
         g_printerr("Failed to open serial port: %s\n", port);
-    }
+    }*/
     return fd;
 }
 
@@ -265,14 +277,15 @@ static void send_voltage_command(serial_fd_t fd, uint8_t reg, int channel, uint1
     uint8_t high = (uint8_t)(value >> 8);
     uint8_t low = (uint8_t)(value & 0xFF);
     
-    uint8_t msg[5];
-    msg[0] = bank;
-    msg[1] = chip;
-    msg[2] = reg;
-    msg[3] = high;
-    msg[4] = low;
+    uint8_t msg[6];
+    msg[0] = DAC_CMD_START; // This byte matters for microcontroller firmware
+    msg[1] = bank;
+    msg[2] = DAC_ADDR[chip]; // get the corresponding DAC address
+    msg[3] = reg;
+    msg[4] = high;
+    msg[5] = low;
 
-    g_print("Sending: %02X %02X %02X %02X %02X\n", msg[0],msg[1],msg[2],msg[3],msg[4]);
+    g_print("Sending 0x: %02X %02X %02X %02X %02X\n", msg[1],msg[2],msg[3],msg[4],msg[5]);
     serial_write(fd, (const char *)msg, sizeof(msg));
 }
 
@@ -301,66 +314,50 @@ static IncomingDataWidgets *global_rx_widgets = NULL;
 
 // Send button callback depends on which radio button is selected
 static void on_send_clicked(GtkButton *button, gpointer user_data) {
-	RadioBtnSelect *data = (RadioBtnSelect *)user_data;
+    RadioBtnSelect *data = (RadioBtnSelect *)user_data;
 
+    
     // Safety check to ensure connection information is wired correctly
     if (!data->conn) {
         g_printerr("Error: Connection data not linked to SPI section.\n");
         return;
     }
 
-	int bytes_to_print = 0;
-	if (gtk_check_button_get_active( GTK_CHECK_BUTTON(data->radio_btn0) )) {
-		//g_print("Sending Byte 0: \n"); // missing entry value
+    int bytes_to_print = 0;
+    if (gtk_check_button_get_active(GTK_CHECK_BUTTON(data->radio_btn0))) {
         bytes_to_print = 1;
-	}
-	else if (gtk_check_button_get_active( GTK_CHECK_BUTTON(data->radio_btn1) )) {
-		//g_print("Sending Bytes 0-1: \n"); // missing entry value
+    }
+    else if (gtk_check_button_get_active(GTK_CHECK_BUTTON(data->radio_btn1))) {
         bytes_to_print = 2;
-	}
-	else if (gtk_check_button_get_active( GTK_CHECK_BUTTON(data->radio_btn2) )) {
-		//g_print("Sending Bytes 0-2: \n"); // missing entry value
+    }
+    else if (gtk_check_button_get_active(GTK_CHECK_BUTTON(data->radio_btn2))) {
         bytes_to_print = 3;
-	}
-
-    // Print the hex bytes
-    char msg[32];
-    char *ptr = msg;
-    size_t remaining = sizeof(msg);
-    int written = 0;
-
-    // SPI bit = 0
-    written = snprintf(ptr, remaining, "0 ");
-    if (written>0 && (size_t)written < remaining) {
-        ptr += written;
-        remaining -= written;
     }
 
-    // Add hex bytes
-    for (int i=0; i<bytes_to_print; i++) {
+    // Build the binary message: [0x02][count][data byte(s)...]
+    char msg[5];
+    msg[0] = 0x02;
+    msg[1] = (char)bytes_to_print;
+
+    for (int i = 0; i < bytes_to_print; i++) {
         const char *hex_val = gtk_editable_get_text(GTK_EDITABLE(data->byte_entries[i]));
-        written = snprintf(ptr, remaining, "%s ", hex_val);
-        
-        // Safety check for truncation/errors
-        if (written<0 || (size_t)written >= remaining) {
-            break;
-        }
-        ptr += written;
-        remaining -= written; 
+        long val = strtol(hex_val, NULL, 16);   // parses "A5", "0xA5", "3F", etc.
+        msg[2 + i] = (char)(val & 0xFF);
     }
 
-    // newline
-    if (remaining > 1) {
-        snprintf(ptr, remaining, "\n");
+    size_t msg_len = (size_t)(2 + bytes_to_print);
+
+    g_print("Sending 0x:");
+    for (int i = 0; i < bytes_to_print; i++) {
+        g_print(" %02X", (unsigned char)msg[2 + i]);
     }
+    g_print("\n");
 
-    g_print("Sending hex bytes: %s", msg);
-
-    if (serial_is_invalid(active_serial_fd)) {
+    /*if (serial_is_invalid(active_serial_fd)) {
         g_printerr("Error: Cannot send. Port not connected!\n");
         return;
-    }
-    serial_write(active_serial_fd, msg, strlen(msg));
+    }*/
+    serial_write(active_serial_fd, msg, msg_len);
 }
 
 // When 'update' clicked, send that voltage to the corresponding channel
@@ -372,10 +369,10 @@ static void on_update_clicked(GtkButton *button, gpointer user_data) {
     double value = atof(gtk_editable_get_text(GTK_EDITABLE(entry)));
     uint16_t v = voltageToCode(value);
 
-    //if (serial_is_invalid(active_serial_fd)) {
-    //    g_printerr("Error: Cannot send. Port not connected!\n");
-    //    return;
-    //}
+    /*if (serial_is_invalid(active_serial_fd)) {
+        g_printerr("Error: Cannot send. Port not connected!\n");
+        return;
+    }*/
     send_voltage_command(active_serial_fd, REG_DAC, CH, v);
 }
 
@@ -388,7 +385,6 @@ static void on_off_clicked(GtkToggleButton *button, gpointer user_data) {
 
     gboolean is_on = gtk_toggle_button_get_active(button);
     set_off_button_visual(GTK_WIDGET(button), is_on);
-    //int OFF = is_on ? 0 : 1; // 0 = DAC powered on, 1 = DAC powered off
     
     uint16_t v;
     if (is_on == TRUE) {
@@ -397,12 +393,19 @@ static void on_off_clicked(GtkToggleButton *button, gpointer user_data) {
         v = 0x0001; // DAC power off
     }
 
-    //if (serial_is_invalid(active_serial_fd)) {
-    //    g_printerr("Error: Cannot send. Port not connected!\n");
-    //    return;
-    //}
+    /*if (serial_is_invalid(active_serial_fd)) {
+        g_printerr("Error: Cannot send. Port not connected!\n");
+        return;
+    }*/
 
     send_voltage_command(active_serial_fd, REG_CONFIG, CH, v);
+}
+
+// Assuming microcontroller RST pin is active LOW, pull it down.
+static void on_reset_clicked(GtkButton *button) {
+    uint8_t msg[2] = {RST_CMD_START, 0x00};
+    g_print("Pulling down RST pin.\n"); // "%02X %02X\n", msg[0], msg[1]
+    serial_write(active_serial_fd, (const char *)msg, sizeof(msg));
 }
 
 static void on_entry_activate(GtkEntry *entry, gpointer user_data) {
@@ -559,6 +562,18 @@ static void on_connect_clicked(GtkButton *button, gpointer user_data) {
 #endif
 }
 
+// Close connection
+static void on_disconnect_clicked(GtkButton *button, gpointer user_data) {
+    g_print("Checking for existing connection to close ...\n");
+    if (!serial_is_invalid(active_serial_fd)) {
+        g_print("Existing connection found. Closing...\n");
+        serial_close(active_serial_fd);
+        active_serial_fd = SERIAL_INVALID;
+        g_print("Closed.\n");
+    }
+    g_print("No connection to close.\n");
+}
+
 // Change toggle 'on/off' state without running callback
 static void set_toggle_silently(GtkToggleButton *tb, BtnCallbackData *off_data, gboolean is_on) {
     g_signal_handlers_block_by_func(tb, G_CALLBACK(on_off_clicked), off_data);
@@ -570,31 +585,19 @@ static void set_toggle_silently(GtkToggleButton *tb, BtnCallbackData *off_data, 
 // Change toggle buttons' state to 'off'
 static void on_alloff_clicked(GtkButton *button, gpointer user_data) {
     AllBtnData *data = (AllBtnData *)user_data;
-
-    serial_fd_t fd = open_serial_from_conn(data->conn);
-    if (serial_is_invalid(fd)) return;
-
-    for (int i = 0; i < 12; i++) {
-        GtkToggleButton *tb = GTK_TOGGLE_BUTTON(data->off_buttons[i]);
-        GtkEntry *entry = GTK_ENTRY(data->entry_boxes[i]);
-        double value = atof(gtk_editable_get_text(GTK_EDITABLE(entry)));
-
-        // Update the UI state without triggering the per-channel signal
-        set_toggle_silently(tb, data->off_data[i], FALSE);
-
-        // Power off each DAC
-        send_voltage_command(fd, REG_CONFIG, data->channel_values[i], 0x0001);
+    for (int i=0; i<12; i++) {
+        gtk_toggle_button_set_active(data->off_buttons[i], FALSE);
+        set_off_button_visual(GTK_WIDGET(data->off_buttons[i]), FALSE);
     }
-
-    serial_close(fd);
+    
 }
 
 // Change toggle buttons' state to 'on'
 static void on_allon_clicked(GtkButton *button, gpointer user_data) {
     AllBtnData *data = (AllBtnData *)user_data;
-
-    for (int i = 0; i < 12; i++) {
-        set_toggle_silently(GTK_TOGGLE_BUTTON(data->off_buttons[i]), data->off_data[i], TRUE);
+    for (int i=0; i<12; i++) {
+        gtk_toggle_button_set_active(data->off_buttons[i], TRUE);
+        set_off_button_visual(GTK_WIDGET(data->off_buttons[i]), TRUE);
     }
 }
 
@@ -611,7 +614,7 @@ static void on_updateall_clicked(GtkButton *button, gpointer user_data) {
         double value    = atof(gtk_editable_get_text(GTK_EDITABLE(entry)));
         uint16_t v = voltageToCode(value);
 
-        send_voltage_command(fd, REG_DAC, data->channel_values[i], v);
+        send_voltage_command(fd, REG_DAC, i, v); //data->channel_values[i]
     }
 
     serial_close(fd);
@@ -651,16 +654,6 @@ gboolean on_key_pressed(GtkEventControllerKey *controller, guint keyval,
 // Initialize GUI widgets inside activate
 static void activate(GtkApplication *app, gpointer user_data) {
     GtkWidget *window;
-    
-    // Setting up CSS from virtual resource path
-    /*GtkCssProvider *css_provider = gtk_css_provider_new();
-    gtk_css_provider_load_from_resource(css_provider, "/com/example/myresource/style.css");
-    GdkDisplay *display = gdk_display_get_default();
-    gtk_style_context_add_provider_for_display(
-        display,
-        GTK_STYLE_PROVIDER(css_provider),
-        GTK_STYLE_PROVIDER_PRIORITY_USER
-    );*/
     
     window = gtk_application_window_new(app);
     gtk_window_set_title(GTK_WINDOW(window), "Reference Voltage Generator");
@@ -717,13 +710,17 @@ static void activate(GtkApplication *app, gpointer user_data) {
     gtk_box_append(GTK_BOX(conn_box), baud_dropdown);
 
     GtkWidget *connect_btn = gtk_button_new_with_label("Connect");
+    GtkWidget *disconnect_btn = gtk_button_new_with_label("Disconnect");
     gtk_widget_set_margin_start(connect_btn, 8);
+    gtk_widget_set_margin_start(disconnect_btn, 8);
 
     ConnectData *conn_data = g_new0(ConnectData, 1);
     conn_data->com_dropdown  = GTK_DROP_DOWN(com_dropdown);
     conn_data->baud_dropdown = GTK_DROP_DOWN(baud_dropdown);
     g_signal_connect(connect_btn, "clicked", G_CALLBACK(on_connect_clicked), conn_data);
+    g_signal_connect(disconnect_btn, "clicked", G_CALLBACK(on_disconnect_clicked), NULL);
     gtk_box_append(GTK_BOX(conn_box), connect_btn);
+    gtk_box_append(GTK_BOX(conn_box), disconnect_btn);
 
     // Channel grid with channel number, voltage entry, increase/decrease, etc
     GtkWidget *grid = gtk_grid_new();
@@ -732,7 +729,7 @@ static void activate(GtkApplication *app, gpointer user_data) {
     gtk_box_append(GTK_BOX(vbox), grid);
  
     GtkWidget       *entry_boxes[12];
-    GtkWidget       *off_buttons[12];
+    GtkToggleButton *off_buttons[12];
     BtnCallbackData *off_cb_data_arr[12]; // one BtnCallbackData* per off button
     GtkWidget       *update_buttons[12];
 
@@ -769,11 +766,11 @@ static void activate(GtkApplication *app, gpointer user_data) {
         gtk_grid_attach(GTK_GRID(grid), down_btn, 3, i, 1, 1);
 
         // column 4: power off channel
-        GtkWidget *off_btn = gtk_toggle_button_new_with_label("OFF");
-        gtk_widget_set_tooltip_text(off_btn, "Set channel to 0 V");
+        GtkToggleButton *off_btn = GTK_TOGGLE_BUTTON(gtk_toggle_button_new_with_label("OFF"));
+        gtk_widget_set_tooltip_text(GTK_WIDGET(off_btn), "Set channel to 0 V");
         BtnCallbackData *off_cb_data = make_btn_data(i, entry_boxes[i], conn_data);
         g_signal_connect(off_btn, "clicked", G_CALLBACK(on_off_clicked), off_cb_data);
-        gtk_grid_attach(GTK_GRID(grid), off_btn, 4, i, 1, 1);
+        gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(off_btn), 4, i, 1, 1);
         off_buttons[i]      = off_btn;
         off_cb_data_arr[i]  = off_cb_data; // save for AllBtnData below
 
@@ -801,7 +798,6 @@ static void activate(GtkApplication *app, gpointer user_data) {
         all_data->off_buttons[i]    = off_buttons[i];
         all_data->off_data[i]       = off_cb_data_arr[i];
         all_data->entry_boxes[i]    = entry_boxes[i];
-        all_data->channel_values[i] = i; 
     }
 
     g_signal_connect(all_off_btn,    "clicked", G_CALLBACK(on_alloff_clicked),    all_data);
@@ -823,10 +819,45 @@ static void activate(GtkApplication *app, gpointer user_data) {
 	gtk_widget_set_margin_bottom(sep2, 8);
 	gtk_box_append(GTK_BOX(vbox), sep2);
 	
-	// section title
+	// SPI section title
 	GtkWidget *spi_title = gtk_label_new(NULL);
 	gtk_label_set_markup(GTK_LABEL(spi_title), "<b>SPI Communication</b>");
 	gtk_box_append(GTK_BOX(vbox), spi_title);
+
+    // Select SPI speed
+    GtkWidget *speed_label = gtk_label_new("Hz");
+    const char *spi_speeds[] = {"1000000", NULL};
+    GtkStringList *speed_list = gtk_string_list_new(spi_speeds);
+    GtkWidget *speed_dropdown = gtk_drop_down_new(G_LIST_MODEL(speed_list), NULL);
+
+    // Select MSB or LSB first
+    GtkWidget *bit_label = gtk_label_new("MSB or LSB");
+    const char *first_bit[] = {"MSBFIRST","LSBFIRST", NULL};
+    GtkStringList *bit_list = gtk_string_list_new(first_bit);
+    GtkWidget *bit_dropdown = gtk_drop_down_new(G_LIST_MODEL(bit_list), NULL);
+
+    // Select SPI mode
+    GtkWidget *mode_label = gtk_label_new("Mode");
+    const char *modes[] = {"SPI_MODE0", "SPI_MODE1", "SPI_MODE2", "SPI_MODE3", NULL};
+    GtkStringList *mode_list = gtk_string_list_new(modes);
+    GtkWidget *mode_dropdown = gtk_drop_down_new(G_LIST_MODEL(mode_list), NULL);
+
+    // Write to Reset pin (any GPIO on a microcontroller)
+    GtkWidget *reset_btn = gtk_button_new_with_label("RESET");
+    g_signal_connect(reset_btn, "clicked", G_CALLBACK(on_reset_clicked), NULL);
+
+    // SPI settings bar
+    GtkWidget *spi_settings = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+    gtk_widget_set_hexpand(spi_settings, TRUE);
+    gtk_widget_set_halign(spi_settings, GTK_ALIGN_CENTER);
+    gtk_box_append(GTK_BOX(spi_settings), speed_label);
+    gtk_box_append(GTK_BOX(spi_settings), speed_dropdown);
+    gtk_box_append(GTK_BOX(spi_settings), bit_label);
+    gtk_box_append(GTK_BOX(spi_settings), bit_dropdown);
+    gtk_box_append(GTK_BOX(spi_settings), mode_label);
+    gtk_box_append(GTK_BOX(spi_settings), mode_dropdown);
+    gtk_box_append(GTK_BOX(spi_settings), reset_btn);
+    gtk_box_append(GTK_BOX(vbox), spi_settings);
 	
 	// SPI byte grid
 	GtkWidget *spi_grid = gtk_grid_new();
@@ -888,7 +919,7 @@ static void activate(GtkApplication *app, gpointer user_data) {
 	gtk_box_append(GTK_BOX(byte_radio_box), byte_radio_btn2);
 	gtk_widget_set_halign(byte_radio_box, GTK_ALIGN_CENTER);
 	
-	// Allocate struct memory	
+	// Add btn data to struct	
 	RadioBtnSelect *radio_btn_data = g_new0(RadioBtnSelect, 1);
 	radio_btn_data->radio_btn0 = byte_radio_btn0;
 	radio_btn_data->radio_btn1 = byte_radio_btn1;
@@ -897,6 +928,13 @@ static void activate(GtkApplication *app, gpointer user_data) {
         radio_btn_data->byte_entries[i] = byte_entries[i];
     }
     radio_btn_data->conn = conn_data;
+
+    // Add SPI settings data to struct
+    SPISettingsData *settings_data = g_new0(SPISettingsData, 1);
+    settings_data->speed_dropdown = GTK_DROP_DOWN(speed_dropdown);
+    settings_data->bit_order_dropdown = GTK_DROP_DOWN(bit_dropdown);
+    settings_data->mode_dropdown = GTK_DROP_DOWN(mode_dropdown);
+    radio_btn_data->settings = settings_data;
 
 	// 'Send' button will send byte via SPI
 	GtkWidget *send_btn = gtk_button_new_with_label("SEND");

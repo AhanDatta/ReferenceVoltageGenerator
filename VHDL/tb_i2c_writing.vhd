@@ -1,4 +1,4 @@
--- Testbench for I2C protocol entity
+-- Testbench for I2C writing entity
 -- Sasha C. Guerrero
 -- 2026 July 8
 
@@ -7,10 +7,10 @@ USE ieee.std_logic_1164.all;
 use ieee.std_logic_arith.all;
 use ieee.std_logic_unsigned.all;
 
-ENTITY tb_i2c_protocol IS -- 'tb' prefix is testbench
+ENTITY tb_i2c_writing IS -- 'tb' prefix is testbench
 END ENTITY;
 
-ARCHITECTURE behave OF tb_i2c_protocol IS
+ARCHITECTURE behave OF tb_i2c_writing IS
 
 -- internal connections
 SIGNAL clk, rst, str, done, ready, SDA, SCL, ACK : std_logic;
@@ -24,7 +24,7 @@ CONSTANT CLK_PERIOD : time := 20 ns;
 BEGIN
 
 -- device under test
-DUT : entity work.i2c_protocol
+DUT : entity work.i2c_writing
 	port map (
 		clk => clk,
 		rst => rst,
@@ -34,8 +34,7 @@ DUT : entity work.i2c_protocol
 		rdy => ready,
 		SDA => SDA,
 		SCL => SCL,
-		ACK => ACK,
-		Q => Q
+		ACK => ACK
 	);
 	
 -- oscillating clock

@@ -1,4 +1,4 @@
--- Finite state machine for I2C master
+-- Finite state machine for I2C writing master
 -- Sasha C. Guerrero
 -- 2026 July 14
 
@@ -19,6 +19,7 @@ ENTITY fsm_i2c_writing_master IS
 		rst_ack_ctr : out std_logic;
 		EN_byte_ctr : out std_logic;
 		rst_byte_ctr : out std_logic;
+		done_byte_out : out std_logic;
 		done : out std_logic;
 		rdy : out std_logic
 	);
@@ -38,6 +39,7 @@ begin
 			rst_ack_ctr  <= '0';
 			EN_byte_ctr  <= '0';
 			rst_byte_ctr <= '0';
+			done_byte_out <= '0';
 			done         <= '0';
 			rdy          <= '1';
 			if str = '1' then
@@ -51,6 +53,7 @@ begin
 			rst_ack_ctr  <= '1';
 			EN_byte_ctr  <= '0';
 			rst_byte_ctr <= '1';
+			done_byte_out <= '0';
 			done         <= '0';
 			rdy          <= '0';
 			nextState    <= "0010";
@@ -60,6 +63,7 @@ begin
 			rst_ack_ctr  <= '0';
 			EN_byte_ctr  <= '0';
 			rst_byte_ctr <= '0';
+			done_byte_out <= '0';
 			done         <= '0';
 			rdy          <= '0';
 			if done_byte = '1' then
@@ -73,6 +77,7 @@ begin
 			rst_ack_ctr  <= '0';
 			EN_byte_ctr  <= '0';
 			rst_byte_ctr <= '0';
+			done_byte_out <= '0';
 			done         <= '0';
 			rdy          <= '0';
 
@@ -91,6 +96,7 @@ begin
 			EN_byte_ctr  <= '0';
 			rst_byte_ctr <= '0';
 			done         <= '0';
+			done_byte_out <= '0';
 			rdy          <= '0';
 			nextState    <= "0110"; -- go to S6
 		
@@ -99,6 +105,7 @@ begin
 			rst_ack_ctr  <= '0';
 			EN_byte_ctr  <= '0';
 			rst_byte_ctr <= '0';
+			done_byte_out <= '0';
 			done         <= '0';
 			rdy          <= '0';
 			nextState    <= "0110"; -- go to S6
@@ -108,6 +115,7 @@ begin
 			rst_ack_ctr  <= '0';
 			EN_byte_ctr  <= '1';
 			rst_byte_ctr <= '0';
+			done_byte_out <= '1';
 			done         <= '0';
 			rdy          <= '0';
 			nextState    <= "0111"; -- go to S6
@@ -117,6 +125,7 @@ begin
 			rst_ack_ctr  <= '0';
 			EN_byte_ctr  <= '0';
 			rst_byte_ctr <= '0';
+			done_byte_out <= '0';
 			done         <= '0';
 			rdy          <= '0';
 			
@@ -131,7 +140,8 @@ begin
 			rst_ack_ctr  <= '1';
 			EN_byte_ctr  <= '0';
 			rst_byte_ctr <= '1';
-			done         <= '1';
+			done_byte_out <= '0';
+			done         <= '0';
 			rdy          <= '0';
 			nextState    <= "0000"; -- go to S0
 		
@@ -140,6 +150,7 @@ begin
 			rst_ack_ctr  <= '0';
 			EN_byte_ctr  <= '0';
 			rst_byte_ctr <= '0';
+			done_byte_out <= '0';
 			done         <= '0';
 			rdy          <= '0';
 			nextState    <= "0000"; -- go to S0

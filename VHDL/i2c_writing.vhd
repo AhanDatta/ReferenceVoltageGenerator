@@ -1,4 +1,4 @@
--- I2C protocol
+-- I2C writing
 -- Sasha C. Guerrero
 -- 2026 July 2
 
@@ -22,8 +22,7 @@ ENTITY i2c_writing IS
 		rdy : out std_logic; -- LED8
 		SDA : inout std_logic; -- bidirectional serial data line
 		SCL : out std_logic; -- serial clock line open
-		ACK : out std_logic; -- LED7 acknowledgement flag
-		Q : out std_logic_vector(7 downto 0)
+		ACK : out std_logic -- LED7 acknowledgement flag
 	);
 END ENTITY i2c_writing;
 
@@ -64,18 +63,6 @@ BEGIN
 			SI => '0', -- 'open' caused error: formal port or parameter 'SI' must have actual or default value
 			D => D,
 			Q => shift_reg_to_mux
-		);
-	
-	Data_Out_Shift_Reg : entity work.R_SHIFT_REG
-		generic map(n => 8)
-		port map(
-			rst => rst,
-			clk => clk,
-			SH => SH, -- signal
-			L => L, -- signal
-			SI => SDA, -- SI is serial in so it will accept 1 bit at a time from SDA
-			D => (others => '0'), -- D is parallel-load, but we don't need it if we want SI only
-			Q => Q
 		);
 	
 	Mux0 : entity work.MUX2_1BIT

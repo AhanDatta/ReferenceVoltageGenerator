@@ -128,11 +128,10 @@ static serial_fd_t open_serial(const char *port, DWORD baud) {
     dcb.fRtsControl = RTS_CONTROL_DISABLE;
 
     if (!SetCommState(hPort, &dcb)) { CloseHandle(hPort); return INVALID_HANDLE_VALUE; }
-
     COMMTIMEOUTS timeouts = { 0 };
-    timeouts.ReadIntervalTimeout         = 50;
-    timeouts.ReadTotalTimeoutConstant    = 500;
-    timeouts.ReadTotalTimeoutMultiplier  = 10;
+    timeouts.ReadIntervalTimeout         = MAXDWORD;
+    timeouts.ReadTotalTimeoutConstant    = 0;
+    timeouts.ReadTotalTimeoutMultiplier  = 0;
     timeouts.WriteTotalTimeoutConstant   = 500;
     timeouts.WriteTotalTimeoutMultiplier = 10;
     SetCommTimeouts(hPort, &timeouts);
@@ -540,8 +539,10 @@ static void set_toggle_silently(GtkToggleButton *tb, BtnCallbackData *off_data, 
 static void on_alloff_clicked(GtkButton *button, gpointer user_data) {
     AllBtnData *data = (AllBtnData *)user_data;
 
-    serial_fd_t fd = open_serial_from_conn(data->conn);
-    if (serial_is_invalid(fd)) return;
+    if (serial_is_invalid(active_serial_fd)) {
+        g_printerr("Error: Cannot send. Port not connected!\n");
+        return;
+    }
 
     for (int i = 0; i < 12; i++) {
         GtkToggleButton *tb = GTK_TOGGLE_BUTTON(data->off_buttons[i]);
@@ -552,10 +553,8 @@ static void on_alloff_clicked(GtkButton *button, gpointer user_data) {
         set_toggle_silently(tb, data->off_data[i], FALSE);
 
         // Execute the logic: Send the OFF command over serial
-        send_voltage_command(fd, 1, data->channel_values[i], value);
+        send_voltage_command(active_serial_fd, 1, data->channel_values[i], value);
     }
-
-    serial_close(fd);
 }
 
 // Change toggle buttons' state to 'on'
@@ -571,18 +570,19 @@ static void on_allon_clicked(GtkButton *button, gpointer user_data) {
 static void on_updateall_clicked(GtkButton *button, gpointer user_data) {
     AllBtnData *data = (AllBtnData *)user_data;
 
-    serial_fd_t fd = open_serial_from_conn(data->conn);
-    if (serial_is_invalid(fd)) return;
+    // Reuse the already-open connection; see comment in on_alloff_clicked.
+    if (serial_is_invalid(active_serial_fd)) {
+        g_printerr("Error: Cannot send. Port not connected!\n");
+        return;
+    }
 
     // Send one command per channel over the single open connection
     for (int i = 0; i < 12; i++) {
         GtkEntry *entry = GTK_ENTRY(data->entry_boxes[i]);
         double value    = atof(gtk_editable_get_text(GTK_EDITABLE(entry)));
 
-        send_voltage_command(fd, 0, data->channel_values[i], value);
+        send_voltage_command(active_serial_fd, 0, data->channel_values[i], value);
     }
-
-    serial_close(fd);
 }
 
 // When the byte entry value is changed, check if it's a valid hex value

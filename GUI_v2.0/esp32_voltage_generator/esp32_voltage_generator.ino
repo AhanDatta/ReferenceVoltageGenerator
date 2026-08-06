@@ -14,17 +14,18 @@ Flash command:
 Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
 
 // SPI pin definitions
-#define NANO_CS_PIN 5
+#define NANO_CS_PIN 5 // chip select
+#define RST_PIN 11 // reset
 
 // ── I2C bus pin definitions ───────────────────────────────────────────────────
-#define BANK0_SDA 3  //21
-#define BANK0_SCL 4  //22
+#define BANK0_SDA 3
+#define BANK0_SCL 4
 
-#define BANK1_SDA 18
-#define BANK1_SCL 19
+#define BANK1_SDA 5
+#define BANK1_SCL 6
 
-#define BANK2_SDA 25  // Bit-bang I2C
-#define BANK2_SCL 26  // Bit-bang I2C
+#define BANK2_SDA 9  // Bit-bang I2C
+#define BANK2_SCL 10  // Bit-bang I2C
 
 // ── I2C bus objects (hardware only for banks 0 & 1) ──────────────────────────
 TwoWire* const i2cHW[2] = { &Wire, &Wire1 };
@@ -249,7 +250,7 @@ void sendDataToNano(byte data) {
   //Serial.println(response_from_nano, HEX);
   
   // These commands will be read by the GUI
-  Serial.print("RX: "); // receiver
+  Serial.print("Received: "); // receiver
   Serial.println(response_from_nano, HEX); // newline after each byte
 
   // Deselect the Nano
