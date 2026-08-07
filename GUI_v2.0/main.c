@@ -315,8 +315,35 @@ static IncomingDataWidgets *global_rx_widgets = NULL;
 // Send button callback depends on which radio button is selected
 static void on_send_clicked(GtkButton *button, gpointer user_data) {
     RadioBtnSelect *data = (RadioBtnSelect *)user_data;
-
     
+    // Get SPI speed from dropdowns
+    GtkStringObject *speed_str = GTK_STRING_OBJECT(
+        gtk_drop_down_get_selected_item(data->settings->speed_dropdown));
+    uint32_t speed = (uint32_t)strtoul(gtk_string_object_get_string(speed_str), NULL, 10);
+
+    // Get SPI Bit Order from dropdowns
+    GtkStringObject *bit_order_str = GTK_STRING_OBJECT(
+        gtk_drop_down_get_selected_item(data->settings->bit_order_dropdown));
+    uint8_t bit_order = (uint8_t)strtoul(gtk_string_object_get_string(bit_order_str), NULL, 10);
+
+    // Get SPI Mode from dropdowns:
+    GtkStringObject *mode_str = GTK_STRING_OBJECT(
+        gtk_drop_down_get_selected_item(data->settings->mode_dropdown));
+    
+    // SPI mode addresses com from Arduino SPI.h library
+    // https://github.com/arduino/ArduinoCore-avr/blob/master/libraries/SPI/src/SPI.h
+    const char *mode = gtk_string_object_get_string(mode_str);
+    uint8_t mode_byte;
+    if (strcmp(mode, "SPI_MODE0") == 0) {
+        mode_byte = 0x00;
+    } else if (strcmp(mode, "SPI_MODE1") == 0) {
+        mode_byte = 0x04;
+    } else if (strcmp(mode, "SPI_MODE2") == 0) {
+        mode_byte = 0x08;
+    } else { // SPI_MODE3
+        mode_byte = 0x0C;
+    }
+
     // Safety check to ensure connection information is wired correctly
     if (!data->conn) {
         g_printerr("Error: Connection data not linked to SPI section.\n");
