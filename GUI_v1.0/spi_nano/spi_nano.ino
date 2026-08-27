@@ -1,70 +1,109 @@
 #include <SPI.h>
+#include <util/atomic.h>
 
-volatile byte receivedData = 0;
-volatile bool dataReady = false;
+const uint8_t responseBytes[3] = {0x11, 0x05, 0x01};
+volatile uint8_t responseIndex = 1;
 
-// idx will be incremented to a max of 3 inside ISR and then reset to 0
-int idx = 0;
+const uint8_t RX_BUFFER_SIZE = 8;
+volatile uint8_t rxBuffer[RX_BUFFER_SIZE];
+volatile uint8_t rxHead = 0;
+volatile uint8_t rxTail = 0;
+volatile bool rxOverflow = false;
 
-// The Nano will alternate sending 3 bytes
-// Receives 1st byte from Feather, back sends arr[0]
-// Receives 2nd byte, sends arr[1]
-// Receives 3rd byte, sends arr[2]
-uint8_t arr[3] = {0x11, 0x05, 0x01};
-
-// Pins
-#define MISO 12
-#define MOSI 11
-#define SCK 13
-#define SS 10
+// Classic Nano / ATmega328P hardware SPI pins.
+const uint8_t NANO_MISO_PIN = 12;
+const uint8_t NANO_MOSI_PIN = 11;
+const uint8_t NANO_SCK_PIN = 13;
+const uint8_t NANO_SS_PIN = 10;
 
 void setup() {
   Serial.begin(115200);
 
   // Set MISO (D12) as OUTPUT so the Nano can send data back if needed
-  pinMode(MISO, OUTPUT);
+  pinMode(NANO_MISO_PIN, OUTPUT);
   
   // Set MOSI (D11), SCK (D13), and SS (D10) as INPUTs (Automatic via hardware, but good practice)
-  pinMode(MOSI, INPUT);
-  pinMode(SCK, INPUT);
-  pinMode(SS, INPUT);
+  pinMode(NANO_MOSI_PIN, INPUT);
+  pinMode(NANO_SCK_PIN, INPUT);
+  pinMode(NANO_SS_PIN, INPUT_PULLUP);
 
-  // Turn on SPI in Slave Mode by modifying the SPI Control Register (SPCR)
-  SPCR |= _BV(SPE);
+  // Explicit SPI peripheral settings: Mode 0, MSB first, interrupts enabled.
+  // MSTR, CPOL, CPHA, and DORD are all left clear.
+  SPCR = _BV(SPE) | _BV(SPIE);
+  SPSR = 0;
 
-  // Respond to the Feather by sending 0xF1
-  //SPDR = 0xF1; // preloading SPI Data Register
+  // MISO must be loaded before the controller clocks the first byte.
+  SPDR = responseBytes[0];
+  responseIndex = 1;
 
-  // Turn on SPI interrupts so we don't miss data while doing other tasks
-  SPI.attachInterrupt();
+  // Nano D10/SS is PB2/PCINT2. Reset the fixed response sequence on each
+  // falling edge of CS; the Feather provides a 10 us CS setup interval.
+  PCIFR = _BV(PCIF0);
+  PCMSK0 |= _BV(PCINT2);
+  PCICR |= _BV(PCIE0);
+
+  Serial.println("READY: SPI peripheral MODE0 MSB FIRST");
 }
 
-// SPI Interrupt Service Routine (ISR) - executes instantly when a byte is received
-ISR(SPI_STC_vect) {  
-  if (idx == 3) idx = 0; // reset idx to avoid out-of-bounds error
-  SPDR = arr[idx];
-  receivedData = SPDR; // Read the byte from the SPI Data Register
-  dataReady = true; // Set flag to process it in the main loop
-  idx++;
-  delay(1000);
+// CS falling begins a new 1-3-byte command and preloads its first MISO byte.
+ISR(PCINT0_vect) {
+  if ((PINB & _BV(PB2)) == 0) {
+    SPDR = responseBytes[0];
+    responseIndex = 1;
+  }
+}
+
+// Runs after one complete byte. A response derived from the received byte can
+// only be shifted out during the next controller transfer (one-byte latency).
+ISR(SPI_STC_vect) {
+  const uint8_t received = SPDR;  // Save MOSI before staging the next MISO byte.
+
+  const uint8_t nextHead = (uint8_t)((rxHead + 1) % RX_BUFFER_SIZE);
+  if (nextHead != rxTail) {
+    rxBuffer[rxHead] = received;
+    rxHead = nextHead;
+  } else {
+    rxOverflow = true;
+  }
+
+  SPDR = responseBytes[responseIndex];
+  responseIndex = (uint8_t)((responseIndex + 1) % 3);
+}
+
+bool popReceivedByte(uint8_t& value) {
+  bool available = false;
+  ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+    if (rxTail != rxHead) {
+      value = rxBuffer[rxTail];
+      rxTail = (uint8_t)((rxTail + 1) % RX_BUFFER_SIZE);
+      available = true;
+    }
+  }
+  return available;
+}
+
+bool takeOverflowFlag() {
+  bool overflowed;
+  ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+    overflowed = rxOverflow;
+    rxOverflow = false;
+  }
+  return overflowed;
+}
+
+void printHexByte(uint8_t value) {
+  if (value < 0x10) Serial.print('0');
+  Serial.print(value, HEX);
 }
 
 void loop() {
-
-  // Send bytes to the Feather
-  // End loop when 3 bytes have been entered
-  // for (int i=0; i<3; i++) {
-  //   String hexStr = Serial.readStringUntil('\n');
-  //   uint8_t value = (uint8_t)strtoul(hexStr.c_str(), NULL, 16);
-  //   arr[i] = value;
-  // }
-
-  // Check if a new byte has arrived
-  if (dataReady) {
-    Serial.print("Received from Feather: 0x");
-    Serial.println(receivedData, HEX);
-
-    dataReady = false;  // Reset the flag
+  uint8_t received;
+  while (popReceivedByte(received)) {
+    Serial.print("RX: ");
+    printHexByte(received);
+    Serial.println();
   }
+
+  if (takeOverflowFlag()) Serial.println("ERR: SPI RX buffer overflow");
 }
 
