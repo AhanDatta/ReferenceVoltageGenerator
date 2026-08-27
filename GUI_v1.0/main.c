@@ -6,10 +6,12 @@ gcc $(pkg-config --cflags gtk4) -o main main.c $(pkg-config --libs gtk4) -lm
 
 #include <gtk/gtk.h>
 #include <math.h>
+#include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <ctype.h>
+#include <errno.h>
 #ifdef _WIN32
 #  include <windows.h>
    typedef HANDLE serial_fd_t;
@@ -31,10 +33,11 @@ gcc $(pkg-config --cflags gtk4) -o main main.c $(pkg-config --libs gtk4) -lm
 // Keep a global or static descriptor variable for the ongoing session
 static serial_fd_t active_serial_fd = SERIAL_INVALID;
 
-// serial connection dropdowns (shared, heap-allocated in activate())
+// serial connection controls (shared, heap-allocated in activate())
 typedef struct {
-    GtkDropDown *com_dropdown;
+    GtkEntry    *port_entry;
     GtkDropDown *baud_dropdown;
+    char         port_name[64];
 } ConnectData;
 
 // per-channel Update button data
@@ -50,7 +53,7 @@ typedef struct {
     BtnCallbackData *off_data[12];       // the 12 BtnCallbackData pointers for the off buttons
                                          // (needed to match the handler when blocking/unblocking signals)
     GtkWidget       *entry_boxes[12];    // the 12 per-channel voltage entries
-    ConnectData     *conn;               // shared serial dropdowns
+    ConnectData     *conn;               // shared serial connection controls
     int              channel_values[12]; // channel index for each row
 } AllBtnData;
 
@@ -60,8 +63,16 @@ typedef struct {
 	GtkWidget *radio_btn1;
 	GtkWidget *radio_btn2;
     GtkWidget *byte_entries[3];
+    GtkWidget *error_label;
     ConnectData *conn; // pointer to the shared ConnectData
 } RadioBtnSelect;
+
+#define SERIAL_RX_BUFFER_SIZE 1024
+
+typedef struct {
+    char data[SERIAL_RX_BUFFER_SIZE];
+    size_t length;
+} SerialRxBuffer;
 
 // voltage helper functions
 static double snap_and_clamp(double value) {
@@ -139,9 +150,17 @@ static serial_fd_t open_serial(const char *port, DWORD baud) {
     return hPort;
 }
 
-static void serial_write(serial_fd_t fd, const char *buf, size_t len) {
-    DWORD written;
-    WriteFile(fd, buf, (DWORD)len, &written, NULL);
+static gboolean serial_write(serial_fd_t fd, const char *buf, size_t len) {
+    size_t total_written = 0;
+    while (total_written < len) {
+        DWORD written = 0;
+        if (!WriteFile(fd, buf + total_written, (DWORD)(len - total_written), &written, NULL) || written == 0) {
+            g_printerr("Serial write failed (Windows error %lu).\n", GetLastError());
+            return FALSE;
+        }
+        total_written += (size_t)written;
+    }
+    return TRUE;
 }
 
 static void serial_close(serial_fd_t fd) {
@@ -194,8 +213,22 @@ static serial_fd_t open_serial(const char *port, speed_t baud) {
     return fd;
 }
 
-static void serial_write(serial_fd_t fd, const char *buf, size_t len) {
-    write(fd, buf, len);
+static gboolean serial_write(serial_fd_t fd, const char *buf, size_t len) {
+    size_t total_written = 0;
+    while (total_written < len) {
+        ssize_t written = write(fd, buf + total_written, len - total_written);
+        if (written < 0) {
+            if (errno == EINTR) continue;
+            g_printerr("Serial write failed: %s\n", g_strerror(errno));
+            return FALSE;
+        }
+        if (written == 0) {
+            g_printerr("Serial write failed: zero bytes written.\n");
+            return FALSE;
+        }
+        total_written += (size_t)written;
+    }
+    return TRUE;
 }
 
 static void serial_close(serial_fd_t fd) {
@@ -208,18 +241,57 @@ static int serial_is_invalid(serial_fd_t fd) {
 
 #endif /* _WIN32 */
 
-// Reads the selected COM port and baud rate strings from the shared
-// dropdowns. Returns FALSE (leaving *port_out/*baud_out untouched) if either
-// dropdown has nothing selected.
+// Reads and normalizes the serial port and selected baud rate. A number by
+// itself is treated as a Windows COM port (for example, "12" becomes "COM12").
 static gboolean get_port_and_baud(ConnectData *conn, const char **port_out, const char **baud_out) {
-    GtkStringObject *com_obj  = GTK_STRING_OBJECT(
-        gtk_drop_down_get_selected_item(conn->com_dropdown));
     GtkStringObject *baud_obj = GTK_STRING_OBJECT(
         gtk_drop_down_get_selected_item(conn->baud_dropdown));
+    const char *entry_text = gtk_editable_get_text(GTK_EDITABLE(conn->port_entry));
 
-    if (!com_obj || !baud_obj) return FALSE;
+    if (!baud_obj || !entry_text) return FALSE;
 
-    *port_out = gtk_string_object_get_string(com_obj);
+    char *trimmed_port = g_strdup(entry_text);
+    g_strstrip(trimmed_port);
+    if (trimmed_port[0] == '\0') {
+        g_free(trimmed_port);
+        return FALSE;
+    }
+
+    const char *number_text = trimmed_port;
+    if (g_ascii_strncasecmp(number_text, "COM", 3) == 0) number_text += 3;
+
+    gboolean is_com_port = number_text[0] != '\0';
+    for (const char *p = number_text; *p != '\0'; p++) {
+        if (!g_ascii_isdigit((guchar)*p)) {
+            is_com_port = FALSE;
+            break;
+        }
+    }
+
+    int written;
+    if (is_com_port) {
+        errno = 0;
+        char *end = NULL;
+        guint64 port_number = g_ascii_strtoull(number_text, &end, 10);
+        if (errno == ERANGE || !end || *end != '\0' || port_number == 0) {
+            g_free(trimmed_port);
+            return FALSE;
+        }
+        written = g_snprintf(conn->port_name, sizeof(conn->port_name),
+                             "COM%" G_GUINT64_FORMAT, port_number);
+    } else {
+#ifdef _WIN32
+        g_free(trimmed_port);
+        return FALSE;
+#else
+        written = g_snprintf(conn->port_name, sizeof(conn->port_name), "%s", trimmed_port);
+#endif
+    }
+    g_free(trimmed_port);
+
+    if (written < 0 || (size_t)written >= sizeof(conn->port_name)) return FALSE;
+
+    *port_out = conn->port_name;
     *baud_out = gtk_string_object_get_string(baud_obj);
     return TRUE;
 }
@@ -269,6 +341,56 @@ typedef struct {
 
 // Global pointer to background listeners
 static IncomingDataWidgets *global_rx_widgets = NULL;
+static GMutex spi_rx_state_mutex;
+static int spi_rx_expected_count = 0;
+static int spi_rx_next_index = 0;
+
+static void set_spi_error(RadioBtnSelect *data, const char *message) {
+    gtk_label_set_text(GTK_LABEL(data->error_label), message ? message : "");
+    gtk_widget_set_visible(data->error_label, message && message[0] != '\0');
+}
+
+static gboolean parse_hex_byte(const char *text, uint8_t *value_out) {
+    size_t length = text ? strlen(text) : 0;
+    if (length < 1 || length > 2) return FALSE;
+
+    for (size_t i = 0; i < length; i++) {
+        if (!isxdigit((unsigned char)text[i])) return FALSE;
+    }
+
+    errno = 0;
+    char *end = NULL;
+    unsigned long value = strtoul(text, &end, 16);
+    if (errno != 0 || !end || *end != '\0' || value > 0xFFUL) return FALSE;
+
+    *value_out = (uint8_t)value;
+    return TRUE;
+}
+
+static void reset_spi_rx_display(int expected_count) {
+    g_mutex_lock(&spi_rx_state_mutex);
+    spi_rx_expected_count = expected_count;
+    spi_rx_next_index = 0;
+    g_mutex_unlock(&spi_rx_state_mutex);
+
+    if (!global_rx_widgets) return;
+    for (int i = 0; i < 3; i++) {
+        gtk_label_set_markup(
+            GTK_LABEL(global_rx_widgets->received_labels[i]),
+            i < expected_count ? "<i>Waiting...</i>" : "<i>Not requested</i>");
+    }
+}
+
+static gboolean reserve_spi_rx_index(int *index_out) {
+    gboolean reserved = FALSE;
+    g_mutex_lock(&spi_rx_state_mutex);
+    if (spi_rx_next_index < spi_rx_expected_count && spi_rx_next_index < 3) {
+        *index_out = spi_rx_next_index++;
+        reserved = TRUE;
+    }
+    g_mutex_unlock(&spi_rx_state_mutex);
+    return reserved;
+}
 
 // Send button callback depends on which radio button is selected
 static void on_send_clicked(GtkButton *button, gpointer user_data) {
@@ -277,61 +399,71 @@ static void on_send_clicked(GtkButton *button, gpointer user_data) {
     // Safety check to ensure connection information is wired correctly
     if (!data->conn) {
         g_printerr("Error: Connection data not linked to SPI section.\n");
+        set_spi_error(data, "SPI controls are not connected correctly.");
         return;
     }
 
-	int bytes_to_print = 0;
+	int bytes_to_send = 0;
 	if (gtk_check_button_get_active( GTK_CHECK_BUTTON(data->radio_btn0) )) {
-		//g_print("Sending Byte 0: \n"); // missing entry value
-        bytes_to_print = 1;
+		bytes_to_send = 1;
 	}
 	else if (gtk_check_button_get_active( GTK_CHECK_BUTTON(data->radio_btn1) )) {
-		//g_print("Sending Bytes 0-1: \n"); // missing entry value
-        bytes_to_print = 2;
+		bytes_to_send = 2;
 	}
 	else if (gtk_check_button_get_active( GTK_CHECK_BUTTON(data->radio_btn2) )) {
-		//g_print("Sending Bytes 0-2: \n"); // missing entry value
-        bytes_to_print = 3;
+		bytes_to_send = 3;
 	}
 
-    // Print the hex bytes
-    char msg[32];
-    char *ptr = msg;
-    size_t remaining = sizeof(msg);
-    int written = 0;
-
-    // SPI bit = 0
-    written = snprintf(ptr, remaining, "0 ");
-    if (written>0 && (size_t)written < remaining) {
-        ptr += written;
-        remaining -= written;
+    if (bytes_to_send == 0) {
+        set_spi_error(data, "Select how many SPI bytes to send.");
+        return;
     }
 
-    // Add hex bytes
-    for (int i=0; i<bytes_to_print; i++) {
+    uint8_t values[3] = {0};
+    for (int i = 0; i < bytes_to_send; i++) {
         const char *hex_val = gtk_editable_get_text(GTK_EDITABLE(data->byte_entries[i]));
-        written = snprintf(ptr, remaining, "%s ", hex_val);
-        
-        // Safety check for truncation/errors
-        if (written<0 || (size_t)written >= remaining) {
-            break;
+        if (!parse_hex_byte(hex_val, &values[i])) {
+            char error_message[96];
+            snprintf(error_message, sizeof(error_message),
+                     "Byte %d must contain one or two hexadecimal digits (00-FF).", i);
+            set_spi_error(data, error_message);
+            gtk_widget_grab_focus(data->byte_entries[i]);
+            return;
         }
-        ptr += written;
-        remaining -= written; 
     }
-
-    // newline
-    if (remaining > 1) {
-        snprintf(ptr, remaining, "\n");
-    }
-
-    g_print("Sending hex bytes: %s", msg);
 
     if (serial_is_invalid(active_serial_fd)) {
         g_printerr("Error: Cannot send. Port not connected!\n");
+        set_spi_error(data, "Connect to the Feather before sending SPI data.");
         return;
     }
-    serial_write(active_serial_fd, msg, strlen(msg));
+
+    char msg[32];
+    size_t used = (size_t)snprintf(msg, sizeof(msg), "0");
+    for (int i = 0; i < bytes_to_send; i++) {
+        int written = snprintf(msg + used, sizeof(msg) - used, " %02X", values[i]);
+        if (written < 0 || (size_t)written >= sizeof(msg) - used) {
+            set_spi_error(data, "Internal error while building the SPI command.");
+            return;
+        }
+        used += (size_t)written;
+    }
+    if (used + 1 >= sizeof(msg)) {
+        set_spi_error(data, "Internal error while building the SPI command.");
+        return;
+    }
+    msg[used++] = '\n';
+    msg[used] = '\0';
+
+    set_spi_error(data, NULL);
+    reset_spi_rx_display(bytes_to_send);
+    g_print("SPI serial command (%d byte%s): %s",
+            bytes_to_send, bytes_to_send == 1 ? "" : "s", msg);
+
+    if (!serial_write(active_serial_fd, msg, used)) {
+        set_spi_error(data, "The serial command could not be written completely.");
+        return;
+    }
 }
 
 // When 'update' clicked, send that voltage to the corresponding channel
@@ -384,37 +516,67 @@ static void on_entry_focus_leave(GtkEventController *controller, gpointer user_d
     apply_value(entry, value);
 }
 
+static gboolean serial_rx_buffer_append(SerialRxBuffer *buffer, const char *data, size_t length) {
+    if (length > sizeof(buffer->data) - buffer->length) {
+        g_printerr("Serial receive line exceeded %d bytes; discarding the incomplete record.\n",
+                   SERIAL_RX_BUFFER_SIZE - 1);
+        buffer->length = 0;
+        return FALSE;
+    }
+    memcpy(buffer->data + buffer->length, data, length);
+    buffer->length += length;
+    return TRUE;
+}
+
+static gboolean serial_rx_buffer_next_line(SerialRxBuffer *buffer, char *line_out, size_t line_size) {
+    char *newline = memchr(buffer->data, '\n', buffer->length);
+    if (!newline) return FALSE;
+
+    size_t line_length = (size_t)(newline - buffer->data);
+    if (line_length > 0 && buffer->data[line_length - 1] == '\r') line_length--;
+    if (line_length >= line_size) line_length = line_size - 1;
+    memcpy(line_out, buffer->data, line_length);
+    line_out[line_length] = '\0';
+
+    size_t consumed = (size_t)(newline - buffer->data) + 1;
+    memmove(buffer->data, buffer->data + consumed, buffer->length - consumed);
+    buffer->length -= consumed;
+    return TRUE;
+}
+
+static gboolean parse_rx_record(const char *line, unsigned int *value_out) {
+    if (strlen(line) != 6 || strncmp(line, "RX: ", 4) != 0 ||
+        !isxdigit((unsigned char)line[4]) || !isxdigit((unsigned char)line[5])) {
+        return FALSE;
+    }
+
+    char token[3] = { line[4], line[5], '\0' };
+    *value_out = (unsigned int)strtoul(token, NULL, 16);
+    return TRUE;
+}
+
 #ifndef _WIN32
 // Callback triggered when the serial port has data to read (Linux)
 static gboolean on_serial_data_available(GIOChannel *source, GIOCondition condition, gpointer user_data) {
+    SerialRxBuffer *rx_buffer = (SerialRxBuffer *)user_data;
     if (condition & (G_IO_IN | G_IO_PRI)) {
         int fd = g_io_channel_unix_get_fd(source);
         char buf[256];
-        ssize_t bytes_read = read(fd, buf, sizeof(buf) - 1);
+        ssize_t bytes_read = read(fd, buf, sizeof(buf));
         
-        if (bytes_read > 0) {
-            buf[bytes_read] = '\0';
-            
-            // Tokenize by newline to catch "RX: <byte>" lines
-            char *line = strtok(buf, "\n");
-            static int byte_index = 0; // Tracks which label to update (0, 1, or 2)
-            
-            while (line != NULL) {
+        if (bytes_read > 0 && serial_rx_buffer_append(rx_buffer, buf, (size_t)bytes_read)) {
+            char line[SERIAL_RX_BUFFER_SIZE];
+            while (serial_rx_buffer_next_line(rx_buffer, line, sizeof(line))) {
+                g_print("Feather serial: %s\n", line);
                 unsigned int hex_val;
-                // Parse the expected format: "RX: <byte>" (e.g., "RX: 0xAA" or "RX: AA")
-                if (sscanf(line, "RX: %x", &hex_val) == 1 || sscanf(line, "RX: 0x%x", &hex_val) == 1) {
-                    if (global_rx_widgets && byte_index < 3) {
+                int byte_index;
+                if (parse_rx_record(line, &hex_val) && reserve_spi_rx_index(&byte_index)) {
+                    if (global_rx_widgets) {
                         char markup[64];
                         snprintf(markup, sizeof(markup), "<b>0x%02X</b>", hex_val);
                         gtk_label_set_markup(GTK_LABEL(global_rx_widgets->received_labels[byte_index]), markup);
-                        
-                        byte_index++;
-                        if (byte_index >= 3) {
-                            byte_index = 0; // Reset after filling all 3 bytes
-                        }
                     }
                 }
-                line = strtok(NULL, "\n");
             }
         }
     }
@@ -461,28 +623,27 @@ static gpointer windows_serial_thread_func(gpointer user_data) {
 
     char rx_buf[512];
     DWORD bytes_read;
-    int byte_index = 0;
+    SerialRxBuffer rx_buffer = {0};
 
     while (TRUE) {
-        if (ReadFile(hPort, rx_buf, sizeof(rx_buf) - 1, &bytes_read, NULL) && bytes_read > 0) {
-            rx_buf[bytes_read] = '\0';
-
-            char *line = strtok(rx_buf, "\n");
-            while (line != NULL) {
+        BOOL read_ok = ReadFile(hPort, rx_buf, sizeof(rx_buf), &bytes_read, NULL);
+        if (!read_ok) {
+            g_printerr("Windows serial reader stopped (error %lu).\n", GetLastError());
+            break;
+        }
+        if (bytes_read > 0 && serial_rx_buffer_append(&rx_buffer, rx_buf, (size_t)bytes_read)) {
+            char line[SERIAL_RX_BUFFER_SIZE];
+            while (serial_rx_buffer_next_line(&rx_buffer, line, sizeof(line))) {
+                g_print("Feather serial: %s\n", line);
                 unsigned int hex_val;
-                if (sscanf(line, "RX: %x", &hex_val) == 1 || sscanf(line, "RX: 0x%x", &hex_val) == 1) {
-
+                int byte_index;
+                if (parse_rx_record(line, &hex_val) && reserve_spi_rx_index(&byte_index)) {
                     UpdatePayload *payload = g_new(UpdatePayload, 1);
                     payload->index = byte_index;
                     payload->val = hex_val;
 
-                    // Pass the named function instead of the lambda
                     g_idle_add_full(G_PRIORITY_DEFAULT_IDLE, update_rx_label_cb, payload, NULL);
-
-                    byte_index++;
-                    if (byte_index >= 3) byte_index = 0;
                 }
-                line = strtok(NULL, "\n");
             }
         }
         g_usleep(10000);
@@ -495,9 +656,15 @@ static gpointer windows_serial_thread_func(gpointer user_data) {
 static void on_connect_clicked(GtkButton *button, gpointer user_data) {
     ConnectData *data = (ConnectData *)user_data;
 
-    const char *port = "None";
-    const char *baud = "None";
-    get_port_and_baud(data, &port, &baud);
+    const char *port;
+    const char *baud;
+    if (!get_port_and_baud(data, &port, &baud)) {
+        g_printerr("Enter a valid serial port before connecting.\n");
+        gtk_widget_add_css_class(GTK_WIDGET(data->port_entry), "error");
+        gtk_widget_grab_focus(GTK_WIDGET(data->port_entry));
+        return;
+    }
+    gtk_widget_remove_css_class(GTK_WIDGET(data->port_entry), "error");
 
     // If an older connection is active, clean it up first
     if (!serial_is_invalid(active_serial_fd)) {
@@ -522,7 +689,10 @@ static void on_connect_clicked(GtkButton *button, gpointer user_data) {
     g_thread_new("windows_serial_reader", windows_serial_thread_func, tdata);
 #else
     GIOChannel *channel = g_io_channel_unix_new(active_serial_fd);
-    g_io_add_watch(channel, G_IO_IN | G_IO_PRI | G_IO_ERR | G_IO_HUP, on_serial_data_available, NULL);
+    SerialRxBuffer *rx_buffer = g_new0(SerialRxBuffer, 1);
+    g_io_add_watch_full(channel, G_PRIORITY_DEFAULT,
+                        G_IO_IN | G_IO_PRI | G_IO_ERR | G_IO_HUP | G_IO_NVAL,
+                        on_serial_data_available, rx_buffer, g_free);
     g_io_channel_unref(channel); // The main loop keeps its own reference now
 #endif
 }
@@ -591,6 +761,12 @@ gboolean on_key_pressed(GtkEventControllerKey *controller, guint keyval,
 	
 	GtkWidget *entry = gtk_event_controller_get_widget(GTK_EVENT_CONTROLLER(controller));
 	GtkEditable *editable = GTK_EDITABLE(entry);
+	(void)editable;
+	(void)keycode;
+	(void)user_date;
+
+    // Let GTK handle copy/paste/select-all; SEND performs authoritative validation.
+    if (state & GDK_CONTROL_MASK) return FALSE;
 	
     // Allow standard navigation and control keys (Backspace, Delete, Left, Right, Tab, Enter)
     if (keyval == GDK_KEY_BackSpace || keyval == GDK_KEY_Delete ||
@@ -655,18 +831,21 @@ static void activate(GtkApplication *app, gpointer user_data) {
     gtk_widget_set_halign(com_label, GTK_ALIGN_CENTER);
     gtk_box_append(GTK_BOX(conn_box), com_label);
 
-    const char *com_ports[] = {
-        "COM1", "COM2", "COM3", "COM4",
-        "COM5", "COM6", "COM7", "COM8",
-        "/dev/ttyUSB0", "/dev/ttyUSB1",
-        "/dev/ttyACM0", "/dev/ttyACM1",
-        NULL
-    };
-    GtkStringList *com_list = gtk_string_list_new(com_ports);
-    GtkWidget *com_dropdown = gtk_drop_down_new(G_LIST_MODEL(com_list), NULL);
-    // Default to /dev/ttyACM0 (index 10)
-    gtk_drop_down_set_selected(GTK_DROP_DOWN(com_dropdown), 10);
-    gtk_box_append(GTK_BOX(conn_box), com_dropdown);
+    GtkWidget *port_entry = gtk_entry_new();
+    gtk_entry_set_max_length(GTK_ENTRY(port_entry), 63);
+    gtk_editable_set_width_chars(GTK_EDITABLE(port_entry), 14);
+#ifdef _WIN32
+    gtk_editable_set_text(GTK_EDITABLE(port_entry), "1");
+    gtk_entry_set_placeholder_text(GTK_ENTRY(port_entry), "e.g. 12");
+    gtk_widget_set_tooltip_text(port_entry,
+        "Enter the COM port number (for example, 12 for COM12). COM12 is also accepted.");
+#else
+    gtk_editable_set_text(GTK_EDITABLE(port_entry), "/dev/ttyACM0");
+    gtk_entry_set_placeholder_text(GTK_ENTRY(port_entry), "e.g. /dev/ttyACM0");
+    gtk_widget_set_tooltip_text(port_entry,
+        "Enter a serial device path, or enter a number to use a Windows COM port.");
+#endif
+    gtk_box_append(GTK_BOX(conn_box), port_entry);
 
     GtkWidget *baud_label = gtk_label_new("Baud Rate:");
     gtk_widget_set_halign(baud_label, GTK_ALIGN_CENTER);
@@ -688,7 +867,7 @@ static void activate(GtkApplication *app, gpointer user_data) {
     gtk_widget_set_margin_start(connect_btn, 8);
 
     ConnectData *conn_data = g_new0(ConnectData, 1);
-    conn_data->com_dropdown  = GTK_DROP_DOWN(com_dropdown);
+    conn_data->port_entry    = GTK_ENTRY(port_entry);
     conn_data->baud_dropdown = GTK_DROP_DOWN(baud_dropdown);
     g_signal_connect(connect_btn, "clicked", G_CALLBACK(on_connect_clicked), conn_data);
     gtk_box_append(GTK_BOX(conn_box), connect_btn);
@@ -762,7 +941,7 @@ static void activate(GtkApplication *app, gpointer user_data) {
     GtkWidget *all_update_btn = gtk_button_new_with_label("All UPDATE");
 
     /* Allocate and populate AllBtnData so the three bulk callbacks can reach
-     * the per-channel widgets and the shared serial dropdowns. */
+     * the per-channel widgets and the shared serial connection controls. */
     AllBtnData *all_data = g_new0(AllBtnData, 1);
     all_data->conn = conn_data;
     for (int i = 0; i < 12; i++) {
@@ -830,6 +1009,10 @@ static void activate(GtkApplication *app, gpointer user_data) {
 		// widget width and grid placement	
 		gtk_widget_set_hexpand(byte_entry, TRUE);
 		gtk_grid_attach(GTK_GRID(spi_grid), byte_entry, i, 1, 1, 1); // column i, row 1
+
+        GtkEventController *key_controller = gtk_event_controller_key_new();
+        g_signal_connect(key_controller, "key-pressed", G_CALLBACK(on_key_pressed), NULL);
+        gtk_widget_add_controller(byte_entry, key_controller);
 		
 		// save to array
 		byte_entries[i] = byte_entry;
@@ -850,11 +1033,19 @@ static void activate(GtkApplication *app, gpointer user_data) {
 	
 	gtk_check_button_set_group(GTK_CHECK_BUTTON(byte_radio_btn1), GTK_CHECK_BUTTON(byte_radio_btn0));
 	gtk_check_button_set_group(GTK_CHECK_BUTTON(byte_radio_btn2), GTK_CHECK_BUTTON(byte_radio_btn0));
+	gtk_check_button_set_active(GTK_CHECK_BUTTON(byte_radio_btn0), TRUE);
 	
 	gtk_box_append(GTK_BOX(byte_radio_box), byte_radio_btn0);
 	gtk_box_append(GTK_BOX(byte_radio_box), byte_radio_btn1);
 	gtk_box_append(GTK_BOX(byte_radio_box), byte_radio_btn2);
 	gtk_widget_set_halign(byte_radio_box, GTK_ALIGN_CENTER);
+
+    GtkWidget *spi_error_label = gtk_label_new("");
+    gtk_widget_add_css_class(spi_error_label, "error");
+    gtk_label_set_wrap(GTK_LABEL(spi_error_label), TRUE);
+    gtk_widget_set_halign(spi_error_label, GTK_ALIGN_CENTER);
+    gtk_widget_set_visible(spi_error_label, FALSE);
+    gtk_box_append(GTK_BOX(vbox), spi_error_label);
 	
 	// Allocate struct memory	
 	RadioBtnSelect *radio_btn_data = g_new0(RadioBtnSelect, 1);
@@ -864,6 +1055,7 @@ static void activate(GtkApplication *app, gpointer user_data) {
     for (int i=0; i<3; i++) {
         radio_btn_data->byte_entries[i] = byte_entries[i];
     }
+    radio_btn_data->error_label = spi_error_label;
     radio_btn_data->conn = conn_data;
 
 	// 'Send' button will send byte via SPI

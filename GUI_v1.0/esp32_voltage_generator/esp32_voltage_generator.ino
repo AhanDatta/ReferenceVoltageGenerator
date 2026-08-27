@@ -13,11 +13,26 @@ Flash command:
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7789.h>
 #include <SPI.h>
+#include <ctype.h>
+
+#if !defined(ARDUINO_ADAFRUIT_FEATHER_ESP32S3_REVTFT)
+#error "Select Tools > Board > Adafruit Feather ESP32-S3 Reverse TFT"
+#endif
 
 Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
 
-// SPI pin definitions
-#define NANO_CS_PIN 13
+// External SPI header on the Adafruit ESP32-S3 Reverse TFT Feather.
+// No chip-select is assigned until the real peripheral CS net is confirmed.
+#define EXT_SPI_SCK_PIN 36
+#define EXT_SPI_MISO_PIN 37
+#define EXT_SPI_MOSI_PIN 35
+#define EXT_SPI_CLOCK_HZ 1000000UL
+
+// Preserve the pre-repair state of D13 exactly. It remains HIGH continuously
+// and is deliberately not used or toggled as SPI chip-select in this test.
+#define PRESERVED_D13_PIN 13
+
+const char FIRMWARE_ID[] = "GUI_v1.0 PINSAFE-D13-HIGH 2026-08-20";
 
 // ── I2C bus pin definitions ───────────────────────────────────────────────────
 #define BANK0_SDA 3  //21
@@ -185,14 +200,13 @@ uint16_t voltageToCode(float v) {
 void setup() {
   Serial.begin(115200);
 
-  // Initialize the custom CS pin as an output
-  pinMode(NANO_CS_PIN, OUTPUT);
+  // Restore the original non-SPI pin state before initializing SPI.
+  pinMode(PRESERVED_D13_PIN, OUTPUT);
+  digitalWrite(PRESERVED_D13_PIN, HIGH);
 
-  // SPI CS lines are active LOW; keep it HIGH to start deselected
-  digitalWrite(NANO_CS_PIN, HIGH);
-
-  // Initialize the main SPI bus
-  SPI.begin();
+  // Bind only the dedicated SCK/MISO/MOSI header pins. Passing -1 for SS keeps
+  // the SPI library from claiming any DAC, rail-control, or unconfirmed CS pin.
+  SPI.begin(EXT_SPI_SCK_PIN, EXT_SPI_MISO_PIN, EXT_SPI_MOSI_PIN, -1);
 
   // Power on the TFT rail and backlight
   pinMode(TFT_I2C_POWER, OUTPUT);
@@ -221,48 +235,85 @@ void setup() {
   // Bit-bang I2C bus (Bank 2)
   sw_init();
 
-  // Scan and init all DACs silently
+  // Give the external bias board time to power up before probing its DACs.
+  delay(250);
+
+  Serial.print("FW: ");
+  Serial.println(FIRMWARE_ID);
+  Serial.println("PIN: D13=HIGH SPI_CS=DISABLED SPI=SCK36/MISO37/MOSI35");
+
+  // Scan and initialize all DACs, reporting whether each device acknowledged.
   for (uint8_t bank = 0; bank < NUM_BANKS; bank++) {
     for (uint8_t chip = 0; chip < DACS_PER_BANK; chip++) {
+      bool found = false;
       if (bank == 2) {
-        if (sw_probe(DAC_ADDR[chip])) dacInit(bank, chip);
+        found = sw_probe(DAC_ADDR[chip]);
       } else {
         i2cHW[bank]->beginTransmission(DAC_ADDR[chip]);
-        if (i2cHW[bank]->endTransmission() == 0) {
-          dacInit(bank, chip);
-        }
+        found = (i2cHW[bank]->endTransmission() == 0);
       }
+
+      bool initialized = found && dacInit(bank, chip);
+      Serial.print("I2C: bank=");
+      Serial.print(bank);
+      Serial.print(" addr=0x");
+      printHexByte(DAC_ADDR[chip]);
+      Serial.print(" status=");
+      Serial.println(initialized ? "OK" : (found ? "INIT_ERR" : "NO_ACK"));
     }
   }
 
   tft.fillScreen(ST77XX_BLACK);
   tft.setCursor(0, 0);
   tft.println("Ready to receive.");
+  tft.setTextSize(1);
+  tft.setCursor(0, 28);
+  tft.println("PINSAFE-D13-HIGH");
 }
 
 // =============================================================================
 //  SPI communication
 // =============================================================================
-void sendDataToNano(byte data) {
-  // Send data at 1MHz, MSBFIRST, SPI_MODE0
-  SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
+void printHexByte(uint8_t value) {
+  if (value < 0x10) Serial.print('0');
+  Serial.print(value, HEX);
+}
 
-  // Select the Nano
-  digitalWrite(NANO_CS_PIN, LOW);
+bool parseHexByteToken(const String& token, uint8_t& value) {
+  if (token.length() < 1 || token.length() > 2) return false;
+  for (size_t i = 0; i < token.length(); i++) {
+    if (!isxdigit((unsigned char)token[i])) return false;
+  }
 
-  // Print the Nano's acknowledgement 0xF1
-  uint8_t response_from_nano = SPI.transfer(data);
-  //Serial.print("Response from Nano: 0x");
-  //Serial.println(response_from_nano, HEX);
-  
-  // These commands will be read by the GUI
-  Serial.print("RX: "); // receiver
-  Serial.println(response_from_nano, HEX); // newline after each byte
+  char* end = nullptr;
+  unsigned long parsed = strtoul(token.c_str(), &end, 16);
+  if (!end || *end != '\0' || parsed > 0xFFUL) return false;
+  value = (uint8_t)parsed;
+  return true;
+}
 
-  // Deselect the Nano
-  digitalWrite(NANO_CS_PIN, HIGH);
+void sendSpiCommand(const uint8_t* tx, uint8_t count) {
+  if (!tx || count < 1 || count > 3) return;
 
+  uint8_t rx[3] = {0};
+  SPI.beginTransaction(SPISettings(EXT_SPI_CLOCK_HZ, MSBFIRST, SPI_MODE0));
+  for (uint8_t i = 0; i < count; i++) {
+    rx[i] = SPI.transfer(tx[i]);
+  }
   SPI.endTransaction();
+
+  Serial.print("TX:");
+  for (uint8_t i = 0; i < count; i++) {
+    Serial.print(' ');
+    printHexByte(tx[i]);
+  }
+  Serial.println();
+
+  for (uint8_t i = 0; i < count; i++) {
+    Serial.print("RX: ");
+    printHexByte(rx[i]);
+    Serial.println();
+  }
 }
 
 // =============================================================================
@@ -276,11 +327,18 @@ void loop() {
     msg.trim();
     if (msg.length() == 0) return;  // Empty msg
 
+    Serial.print("CMD: ");
+    Serial.println(msg);
+
     // Get protocol bit to determine if we send through I2C or SPI
     int firstSpaceIdx = msg.indexOf(' ');
     if (firstSpaceIdx < 0) return;  // Malformed msg
     String protocolStr = msg.substring(0, firstSpaceIdx);
-    int protocol = protocolStr.toInt();
+    if (protocolStr != "0" && protocolStr != "1") {
+      Serial.println("ERR: protocol must be 0 or 1");
+      return;
+    }
+    bool protocol = (protocolStr == "1");
 
     // I2C variables
     String offStr, dacStr, voltStr;
@@ -308,11 +366,28 @@ void loop() {
       if (voltage < 0.0f) voltage = 0.0f;
       if (voltage > VFULL_SCALE) voltage = VFULL_SCALE;
 
-      // Write voltage to DAC
+      // Write voltage and power state to the DAC. Check both acknowledgements;
+      // the TFT must not claim success when the external board is unreachable.
       uint8_t bank = (uint8_t)dacIndex / DACS_PER_BANK;
       uint8_t chip = (uint8_t)dacIndex % DACS_PER_BANK;
       uint16_t code = voltageToCode(voltage);
-      dacWriteReg(bank, chip, REG_DAC, code);
+      bool voltageOk = dacWriteReg(bank, chip, REG_DAC, code);
+      bool configOk = dacWriteReg(bank, chip, REG_CONFIG, offValue ? 0x0001 : 0x0000);
+      bool dacOk = voltageOk && configOk;
+
+      Serial.print("DAC: bank=");
+      Serial.print(bank);
+      Serial.print(" addr=0x");
+      printHexByte(DAC_ADDR[chip]);
+      Serial.print(" code=0x");
+      if (code < 0x1000) Serial.print('0');
+      if (code < 0x0100) Serial.print('0');
+      if (code < 0x0010) Serial.print('0');
+      Serial.print(code, HEX);
+      Serial.print(" power=");
+      Serial.print(offValue ? "OFF" : "ON");
+      Serial.print(" status=");
+      Serial.println(dacOk ? "OK" : "NO_ACK");
 
       // Update TFT
       //--------------------------------------------------
@@ -331,13 +406,11 @@ void loop() {
         tft.setTextColor(ST77XX_RED);
         tft.println(" OFF");
         //--------------------------------------
-        dacWriteReg(bank, chip, REG_CONFIG, 0x0001);  // power down bit (0) value 1
       } else {
         //----------------------------------------------------
         tft.setTextColor(ST77XX_GREEN);
         //----------------------------------------------------
         tft.println(" ON");
-        dacWriteReg(bank, chip, REG_CONFIG, 0x0000);  // change power down bit (0) to value 0
       }
 
       // Row 2: Voltage
@@ -347,8 +420,13 @@ void loop() {
       tft.println("VOLTAGE:");
       tft.setTextColor(ST77XX_WHITE);
       tft.setCursor(0, 100);
-      tft.print(voltage, 4);  // Display up to 4 decimal places
-      tft.print(" V");
+      if (dacOk) {
+        tft.print(voltage, 4);  // Display up to 4 decimal places
+        tft.print(" V");
+      } else {
+        tft.setTextColor(ST77XX_RED);
+        tft.print("I2C ERROR");
+      }
     }
 
     // If protocol bit is 0,choose SPI
@@ -356,31 +434,34 @@ void loop() {
       String rest = msg.substring(firstSpaceIdx + 1);
       rest.trim();
 
-      String byteStrs[3];
-      int numBytes = 0;
-      int idx = 0;
+      uint8_t tx[3] = {0};
+      uint8_t numBytes = 0;
+      int position = 0;
+      while (position < (int)rest.length()) {
+        while (position < (int)rest.length() && isspace((unsigned char)rest[position])) position++;
+        if (position >= (int)rest.length()) break;
 
-      while (numBytes < 3) {
-        int spaceIdx = rest.indexOf(' ', idx);
-        if (spaceIdx < 0) {
-          // Last (or only) remaining token
-          String token = rest.substring(idx);
-          if (token.length() > 0) {
-            byteStrs[numBytes++] = token;
-          }
-          break;
+        int tokenStart = position;
+        while (position < (int)rest.length() && !isspace((unsigned char)rest[position])) position++;
+        String token = rest.substring(tokenStart, position);
+
+        if (numBytes >= 3) {
+          Serial.println("ERR: SPI command accepts one to three bytes");
+          return;
         }
-        byteStrs[numBytes++] = rest.substring(idx, spaceIdx);
-        idx = spaceIdx + 1;
+        if (!parseHexByteToken(token, tx[numBytes])) {
+          Serial.print("ERR: invalid SPI hex byte: ");
+          Serial.println(token);
+          return;
+        }
+        numBytes++;
       }
 
-      // Send the number of bytes indicated by GUI
-      if (numBytes == 0) return;  // Malformed msg; no bytes given
-      for (int i = 0; i < numBytes; i++) {
-        byte b = (byte)strtol(byteStrs[i].c_str(), NULL, 16);
-        sendDataToNano(b);
-        delay(1000);
+      if (numBytes == 0) {
+        Serial.println("ERR: SPI command contains no data bytes");
+        return;
       }
+      sendSpiCommand(tx, numBytes);
     }
   }
 }

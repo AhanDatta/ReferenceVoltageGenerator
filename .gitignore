@@ -4,3 +4,9 @@ VHDL/work/
 VHDL/i2c.cr.mti
 VHDL/i2c.mpf
 *.bak
+
+# GUI build output
+GUI_v2.0/main
+GUI_v2.0/main.exe
+GUI_v2.0/src/*.o
+GUI_v2.0/src/*.d
